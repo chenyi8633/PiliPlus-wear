@@ -686,7 +686,7 @@ jobs:
           put('lib/plugin/gecko_webview.dart', r"""import 'dart:async';
           import 'dart:convert' show jsonEncode;
 
-          import 'package:flutter/foundation.dart' show debugPrint;
+          import 'package:flutter/foundation.dart' show Factory, debugPrint;
           import 'package:flutter/gestures.dart';
           import 'package:flutter/rendering.dart';
           import 'package:flutter/services.dart';
