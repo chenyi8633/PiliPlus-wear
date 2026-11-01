@@ -1112,6 +1112,11 @@ jobs:
           """)
               write(p, GECKO_IMPORT + read(p))
 
+          # ---- 6.7 GeckoView 要求 minSdk >= 26(Wear OS 4/5/6 都是 API 33+,没有影响) ----
+          p = 'android/app/src/main/../../../app/build.gradle.kts'.replace('android/app/src/main/../../../app', 'android/app')
+          if 'minSdk = flutter.minSdkVersion' in read(p):
+              sub(p, 'minSdk = flutter.minSdkVersion', 'minSdk = 26')
+
           print('[wear_patch] done')
           PYEOF
 
