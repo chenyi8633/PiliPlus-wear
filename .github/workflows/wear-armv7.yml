@@ -1,4 +1,4 @@
-name: Build Wear OS armv7 APK
+name: Build Wear OS armv7 APK (GeckoView)
 
 # 用法:把整个文件内容粘贴到仓库的 .github/workflows/wear-armv7.yml
 # 然后到 Actions 页面选 "Build Wear OS armv7 APK" -> Run workflow
@@ -200,6 +200,913 @@ jobs:
                      '    <uses-feature android:name="android.hardware.type.watch" />\n\n    <application xmlns:tools="http://schemas.android.com/tools"')
               sub(p, '        <meta-data\n            android:name="io.flutter.embedding.android.EnableImpeller"',
                      '        <uses-library\n            android:name="com.google.android.wearable"\n            android:required="false" />\n        <meta-data\n            android:name="com.google.android.wearable.standalone"\n            android:value="true" />\n        <meta-data\n            android:name="io.flutter.embedding.android.EnableImpeller"')
+
+          # =====================================================================
+          # 6. GeckoView(内置 32 位网页引擎) —— 替代系统 WebView,手表没有 WebView 也能打开网页
+          # =====================================================================
+          def put(path, text):
+              d = os.path.dirname(path)
+              if d:
+                  os.makedirs(d, exist_ok=True)
+              write(path, text)
+
+          def resolve_gecko_version():
+              forced = os.environ.get('GECKO_VERSION')
+              if forced:
+                  return forced
+              import re, urllib.request
+              url = 'https://maven.mozilla.org/maven2/org/mozilla/geckoview/geckoview-armeabi-v7a/maven-metadata.xml'
+              try:
+                  xml = urllib.request.urlopen(url, timeout=60).read().decode('utf-8', 'replace')
+              except Exception as e:
+                  sys.exit(f'[wear_patch] 无法读取 GeckoView 版本列表 {url}: {e}')
+              vers = re.findall(r'<version>([^<]+)</version>', xml)
+              def key(v):
+                  try:
+                      return tuple(int(x) for x in v.split('.'))
+                  except ValueError:
+                      return (-1,)
+              major = os.environ.get('GECKO_MAJOR')
+              if major:
+                  vers = [v for v in vers if v.split('.')[0] == major]
+              vers = [v for v in vers if key(v) != (-1,)]
+              if not vers:
+                  sys.exit('[wear_patch] 版本列表里没有可用的 GeckoView 版本')
+              best = max(vers, key=key)
+              print('[wear_patch] GeckoView version =', best)
+              return best
+
+          GECKO_VIEW_TYPE = 'com.example.piliplus/gecko_view'
+          KT_DIR = 'android/app/src/main/kotlin/com/example/piliplus'
+          EXT_DIR = 'android/app/src/main/assets/geckoext'
+
+          # ---- 6.1 Gradle ----
+          p = 'android/build.gradle.kts'
+          if 'maven.mozilla.org' not in read(p):
+              sub(p, "        google()\n        mavenCentral()\n    }\n}\n",
+                     "        google()\n        mavenCentral()\n        maven { url = uri(\"https://maven.mozilla.org/maven2/\") }\n    }\n}\n")
+
+          p = 'android/app/build.gradle.kts'
+          if 'org.mozilla.geckoview' not in read(p):
+              gv = resolve_gecko_version()
+              sub(p, 'flutter {\n    source = "../.."\n}',
+                     'flutter {\n    source = "../.."\n}\n\ndependencies {\n    implementation("org.mozilla.geckoview:geckoview-armeabi-v7a:' + gv + '")\n}')
+
+          # ---- 6.2 内置 WebExtension (用来给 B 站网页注入 Cookie、处理笔记页/直播页) ----
+          put(EXT_DIR + '/manifest.json', r"""{
+            "manifest_version": 2,
+            "name": "PiliPlus Helper",
+            "version": "1.0",
+            "browser_specific_settings": { "gecko": { "id": "pili@piliplus.app" } },
+            "permissions": [
+              "nativeMessaging",
+              "geckoViewAddons",
+              "cookies",
+              "*://*.bilibili.com/*"
+            ],
+            "background": { "scripts": ["background.js"] },
+            "content_scripts": [
+              {
+                "matches": ["*://*.bilibili.com/*"],
+                "js": ["content.js"],
+                "run_at": "document_start",
+                "all_frames": true
+              }
+            ]
+          }
+          """)
+
+          put(EXT_DIR + '/background.js', r"""var port = null;
+
+          function connect() {
+            try {
+              port = browser.runtime.connectNative("browser");
+              port.onMessage.addListener(onNative);
+              port.onDisconnect.addListener(function () {
+                port = null;
+                setTimeout(connect, 1000);
+              });
+            } catch (e) {
+              port = null;
+              setTimeout(connect, 1000);
+            }
+          }
+
+          async function onNative(msg) {
+            if (!msg || msg.type !== "cookies") return;
+            var ok = 0;
+            var list = msg.cookies || [];
+            for (var i = 0; i < list.length; i++) {
+              var c = list[i];
+              try {
+                var host = String(c.domain || "bilibili.com").replace(/^\./, "");
+                await browser.cookies.set({
+                  url: "https://" + host + (c.path || "/"),
+                  name: c.name,
+                  value: c.value,
+                  domain: "." + host,
+                  path: c.path || "/",
+                  secure: !!c.secure,
+                  httpOnly: !!c.httpOnly,
+                  expirationDate: Math.floor(Date.now() / 1000) + 31536000
+                });
+                ok++;
+              } catch (e) {}
+            }
+            try {
+              if (port) port.postMessage({ type: "cookiesSet", ok: ok });
+            } catch (e) {}
+          }
+
+          connect();
+          """)
+
+          put(EXT_DIR + '/content.js', r"""(function () {
+            var href = location.href;
+
+            function send(m) {
+              try {
+                location.href = "pilimsg://m/" + encodeURIComponent(m);
+              } catch (e) {}
+            }
+
+            if (href.indexOf("https://www.bilibili.com/h5/note-app") === 0) {
+              document.addEventListener("click", function (e) {
+                var t = e.target;
+                var finish = t && t.closest ? t.closest(".finish-btn") : null;
+                if (finish) { send("finishButtonClicked"); return; }
+                var info = t && t.closest ? t.closest(".info-bar") : null;
+                if (info) { send("infoBarClicked"); }
+              }, true);
+            }
+
+            if (href.indexOf("https://live.bilibili.com") === 0) {
+              var inject = function () {
+                if (document.getElementById("pili-live-style")) return;
+                var s = document.createElement("style");
+                s.id = "pili-live-style";
+                s.textContent = "div.open-app-btn.bili-btn-warp {display:none !important;} #app__display-area > div.control-panel {display:none !important;}";
+                (document.head || document.documentElement).appendChild(s);
+              };
+              if (document.readyState === "loading") {
+                document.addEventListener("DOMContentLoaded", inject);
+              } else {
+                inject();
+              }
+            }
+          })();
+          """)
+
+          # ---- 6.3 Kotlin ----
+          put(KT_DIR + '/GeckoHolder.kt', r"""package com.example.piliplus
+
+          import android.content.Context
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.util.Log
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import org.mozilla.geckoview.GeckoRuntime
+          import org.mozilla.geckoview.GeckoRuntimeSettings
+          import org.mozilla.geckoview.WebExtension
+
+          object GeckoHolder {
+              private const val TAG = "PiliGecko"
+              private var runtime: GeckoRuntime? = null
+              private var port: WebExtension.Port? = null
+              private var pendingDone: (() -> Unit)? = null
+              private val handler = Handler(Looper.getMainLooper())
+
+              private val portDelegate = object : WebExtension.PortDelegate {
+                  override fun onPortMessage(message: Any, port: WebExtension.Port) {
+                      val type = (message as? JSONObject)?.optString("type")
+                      if (type == "cookiesSet") finishPending()
+                  }
+
+                  override fun onDisconnect(port: WebExtension.Port) {
+                      if (this@GeckoHolder.port === port) this@GeckoHolder.port = null
+                  }
+              }
+
+              private val messageDelegate = object : WebExtension.MessageDelegate {
+                  override fun onConnect(port: WebExtension.Port) {
+                      this@GeckoHolder.port = port
+                      port.setDelegate(portDelegate)
+                  }
+              }
+
+              fun runtime(context: Context): GeckoRuntime {
+                  runtime?.let { return it }
+                  val settings = GeckoRuntimeSettings.Builder()
+                      .javaScriptEnabled(true)
+                      .build()
+                  val rt = GeckoRuntime.create(context.applicationContext, settings)
+                  runtime = rt
+                  try {
+                      rt.webExtensionController
+                          .ensureBuiltIn("resource://android/assets/geckoext/", "pili@piliplus.app")
+                          .accept(
+                              { ext -> ext?.setMessageDelegate(messageDelegate, "browser") },
+                              { err -> Log.e(TAG, "install extension failed", err) }
+                          )
+                  } catch (e: Exception) {
+                      Log.e(TAG, "install extension error", e)
+                  }
+                  return rt
+              }
+
+              private fun finishPending() {
+                  val d = pendingDone
+                  pendingDone = null
+                  d?.invoke()
+              }
+
+              /** 把 App 里的登录 Cookie 写进 Gecko(含 HttpOnly),完成后回调 done。 */
+              fun syncCookies(json: String, done: () -> Unit) {
+                  val start = SystemClock.uptimeMillis()
+                  fun attempt() {
+                      val p = port
+                      if (p == null) {
+                          if (SystemClock.uptimeMillis() - start < 4000) {
+                              handler.postDelayed({ attempt() }, 200)
+                          } else {
+                              done()
+                          }
+                          return
+                      }
+                      finishPending()
+                      pendingDone = done
+                      try {
+                          p.postMessage(
+                              JSONObject().put("type", "cookies").put("cookies", JSONArray(json))
+                          )
+                      } catch (e: Exception) {
+                          Log.e(TAG, "post cookies failed", e)
+                          finishPending()
+                          return
+                      }
+                      handler.postDelayed({ finishPending() }, 2000)
+                  }
+                  attempt()
+              }
+          }
+          """)
+
+          put(KT_DIR + '/GeckoPlatformView.kt', r"""package com.example.piliplus
+
+          import android.content.Context
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.View
+          import io.flutter.plugin.common.BinaryMessenger
+          import io.flutter.plugin.common.MethodCall
+          import io.flutter.plugin.common.MethodChannel
+          import io.flutter.plugin.common.StandardMessageCodec
+          import io.flutter.plugin.platform.PlatformView
+          import io.flutter.plugin.platform.PlatformViewFactory
+          import org.mozilla.geckoview.AllowOrDeny
+          import org.mozilla.geckoview.GeckoResult
+          import org.mozilla.geckoview.GeckoSession
+          import org.mozilla.geckoview.GeckoSessionSettings
+          import org.mozilla.geckoview.GeckoView
+          import org.mozilla.geckoview.StorageController
+          import org.mozilla.geckoview.WebResponse
+
+          class GeckoViewFactory(private val messenger: BinaryMessenger) :
+              PlatformViewFactory(StandardMessageCodec.INSTANCE) {
+              override fun create(context: Context?, viewId: Int, args: Any?): PlatformView {
+                  return GeckoPlatformView(context!!, viewId, messenger, args as? Map<*, *>)
+              }
+          }
+
+          class GeckoPlatformView(
+              private val context: Context,
+              id: Int,
+              messenger: BinaryMessenger,
+              params: Map<*, *>?,
+          ) : PlatformView, MethodChannel.MethodCallHandler {
+
+              private val channel = MethodChannel(messenger, "com.example.piliplus/gecko_$id")
+              private val geckoView = GeckoView(context)
+              private val session: GeckoSession
+              private val handler = Handler(Looper.getMainLooper())
+              private var disposed = false
+              private var canBack = false
+
+              init {
+                  channel.setMethodCallHandler(this)
+
+                  val ua = params?.get("userAgent") as? String
+                  val incognito = (params?.get("incognito") as? Boolean) ?: false
+                  val builder = GeckoSessionSettings.Builder().usePrivateMode(incognito)
+                  if (!ua.isNullOrEmpty()) builder.userAgentOverride(ua)
+                  session = GeckoSession(builder.build())
+
+                  session.progressDelegate = object : GeckoSession.ProgressDelegate {
+                      override fun onPageStart(session: GeckoSession, url: String) {
+                          channel.invokeMethod("onUrlChanged", mapOf("url" to url))
+                      }
+
+                      override fun onPageStop(session: GeckoSession, success: Boolean) {
+                          channel.invokeMethod("onProgress", mapOf("progress" to 1.0))
+                      }
+
+                      override fun onProgressChange(session: GeckoSession, progress: Int) {
+                          channel.invokeMethod("onProgress", mapOf("progress" to progress / 100.0))
+                      }
+                  }
+
+                  session.contentDelegate = object : GeckoSession.ContentDelegate {
+                      override fun onTitleChange(session: GeckoSession, title: String?) {
+                          channel.invokeMethod("onTitleChanged", mapOf("title" to (title ?: "")))
+                      }
+
+                      override fun onCloseRequest(session: GeckoSession) {
+                          channel.invokeMethod("onCloseWindow", null)
+                      }
+
+                      override fun onExternalResponse(session: GeckoSession, response: WebResponse) {
+                          channel.invokeMethod("onDownload", mapOf("url" to response.uri))
+                      }
+                  }
+
+                  session.navigationDelegate = object : GeckoSession.NavigationDelegate {
+                      override fun onCanGoBack(session: GeckoSession, canGoBack: Boolean) {
+                          canBack = canGoBack
+                      }
+
+                      override fun onNewSession(session: GeckoSession, uri: String): GeckoResult<GeckoSession>? {
+                          channel.invokeMethod("onNewWindow", mapOf("url" to uri))
+                          return null
+                      }
+
+                      override fun onLoadRequest(
+                          session: GeckoSession,
+                          request: GeckoSession.NavigationDelegate.LoadRequest,
+                      ): GeckoResult<AllowOrDeny>? {
+                          val uri = request.uri
+                          if (uri.startsWith("pilimsg://")) {
+                              val msg = try {
+                                  Uri.decode(uri.substringAfter("pilimsg://m/"))
+                              } catch (e: Exception) {
+                                  ""
+                              }
+                              channel.invokeMethod("onWebMessageReceived", mapOf("message" to msg))
+                              return GeckoResult.fromValue(AllowOrDeny.DENY)
+                          }
+                          if (uri.startsWith("data:") || uri.startsWith("about:") || uri.startsWith("blob:")) {
+                              return GeckoResult.fromValue(AllowOrDeny.ALLOW)
+                          }
+                          val result = GeckoResult<AllowOrDeny>()
+                          var done = false
+                          fun finish(allow: Boolean) {
+                              if (done) return
+                              done = true
+                              result.complete(if (allow) AllowOrDeny.ALLOW else AllowOrDeny.DENY)
+                          }
+                          handler.postDelayed({ finish(true) }, 5000)
+                          channel.invokeMethod(
+                              "onNavigationRequest",
+                              mapOf("url" to uri),
+                              object : MethodChannel.Result {
+                                  override fun success(r: Any?) {
+                                      finish(r != false)
+                                  }
+
+                                  override fun error(code: String, message: String?, details: Any?) {
+                                      finish(true)
+                                  }
+
+                                  override fun notImplemented() {
+                                      finish(true)
+                                  }
+                              }
+                          )
+                          return result
+                      }
+                  }
+
+                  val runtime = GeckoHolder.runtime(context)
+                  session.open(runtime)
+                  geckoView.setSession(session)
+
+                  val url = params?.get("initialUrl") as? String
+                  val html = params?.get("initialHtml") as? String
+                  val cookies = params?.get("cookies") as? String
+                  val start = {
+                      if (!disposed) {
+                          if (html != null) {
+                              session.load(GeckoSession.Loader().data(html, "text/html"))
+                          } else if (url != null) {
+                              session.loadUri(url)
+                          }
+                      }
+                  }
+                  if (!cookies.isNullOrEmpty()) {
+                      GeckoHolder.syncCookies(cookies) { start() }
+                  } else {
+                      start()
+                  }
+              }
+
+              override fun getView(): View = geckoView
+
+              override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+                  if (disposed) {
+                      result.success(null)
+                      return
+                  }
+                  when (call.method) {
+                      "loadUrl" -> {
+                          session.loadUri(call.argument<String>("url") ?: "about:blank")
+                          result.success(null)
+                      }
+                      "reload" -> {
+                          session.reload()
+                          result.success(null)
+                      }
+                      "goBack" -> {
+                          session.goBack()
+                          result.success(null)
+                      }
+                      "canGoBack" -> result.success(canBack)
+                      "clearCache" -> {
+                          GeckoHolder.runtime(context).storageController.clearData(
+                              StorageController.ClearFlags.NETWORK_CACHE or StorageController.ClearFlags.IMAGE_CACHE
+                          )
+                          result.success(null)
+                      }
+                      "setCookies" -> {
+                          val json = call.argument<String>("cookies") ?: "[]"
+                          GeckoHolder.syncCookies(json) {
+                              if (!disposed) session.reload()
+                          }
+                          result.success(null)
+                      }
+                      else -> result.notImplemented()
+                  }
+              }
+
+              override fun dispose() {
+                  if (disposed) return
+                  disposed = true
+                  channel.setMethodCallHandler(null)
+                  try {
+                      geckoView.releaseSession()
+                      session.close()
+                  } catch (e: Exception) {
+                  }
+              }
+          }
+          """)
+
+          p = KT_DIR + '/MainActivity.kt'
+          if 'GeckoViewFactory' not in read(p):
+              sub(p, "import com.ryanheise.audioservice.AudioServiceActivity\n",
+                     "import com.ryanheise.audioservice.AudioServiceActivity\nimport io.flutter.embedding.engine.FlutterEngine\n")
+              sub(p, "class MainActivity : AudioServiceActivity() {\n",
+          """class MainActivity : AudioServiceActivity() {
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  flutterEngine.platformViewsController.registry.registerViewFactory(
+                      "com.example.piliplus/gecko_view",
+                      GeckoViewFactory(flutterEngine.dartExecutor.binaryMessenger)
+                  )
+              }
+
+          """)
+
+          # ---- 6.4 Dart: gecko_webview.dart ----
+          put('lib/plugin/gecko_webview.dart', r"""import 'dart:async';
+          import 'dart:convert' show jsonEncode;
+
+          import 'package:flutter/foundation.dart' show debugPrint;
+          import 'package:flutter/gestures.dart';
+          import 'package:flutter/rendering.dart';
+          import 'package:flutter/services.dart';
+          import 'package:flutter/widgets.dart';
+
+          const String _viewType = 'com.example.piliplus/gecko_view';
+
+          /// 内置 GeckoView(Mozilla 网页引擎) 的控制器,接口和 LinuxWebviewController 类似。
+          class GeckoWebviewController {
+            GeckoWebviewController._(this.viewId)
+              : _channel = MethodChannel('com.example.piliplus/gecko_$viewId');
+
+            final int viewId;
+            final MethodChannel _channel;
+            String? currentUrl;
+
+            Future<void> _call(String method, [Object? args]) async {
+              try {
+                await _channel.invokeMethod<void>(method, args);
+              } catch (e) {
+                debugPrint('GeckoWebview.$method error: $e');
+              }
+            }
+
+            Future<void> loadUrl(String url) => _call('loadUrl', {'url': url});
+
+            Future<void> reload() => _call('reload');
+
+            Future<void> goBack() => _call('goBack');
+
+            Future<void> clearCache() => _call('clearCache');
+
+            Future<void> setCookies(List<Map<String, Object?>> cookies) =>
+                _call('setCookies', {'cookies': jsonEncode(cookies)});
+
+            Future<bool> canGoBack() async {
+              try {
+                return await _channel.invokeMethod<bool>('canGoBack') ?? false;
+              } catch (_) {
+                return false;
+              }
+            }
+          }
+
+          class GeckoWebview extends StatefulWidget {
+            const GeckoWebview({
+              super.key,
+              this.initialUrl,
+              this.initialHtml,
+              this.userAgent,
+              this.incognito = false,
+              this.cookies,
+              this.onWebViewCreated,
+              this.onUrlChanged,
+              this.onTitleChanged,
+              this.onProgress,
+              this.onWebMessageReceived,
+              this.onNavigationRequest,
+              this.onDownload,
+              this.onCloseWindow,
+            });
+
+            final String? initialUrl;
+            final String? initialHtml;
+            final String? userAgent;
+            final bool incognito;
+
+            /// 要写入引擎的 Cookie(name/value/domain/path/secure/httpOnly)
+            final List<Map<String, Object?>>? cookies;
+
+            final ValueChanged<GeckoWebviewController>? onWebViewCreated;
+            final ValueChanged<String>? onUrlChanged;
+            final ValueChanged<String>? onTitleChanged;
+            final ValueChanged<double>? onProgress;
+            final ValueChanged<String>? onWebMessageReceived;
+
+            /// 返回 true 允许加载,false 取消加载
+            final Future<bool> Function(String url)? onNavigationRequest;
+            final ValueChanged<String>? onDownload;
+            final VoidCallback? onCloseWindow;
+
+            @override
+            State<GeckoWebview> createState() => _GeckoWebviewState();
+          }
+
+          class _GeckoWebviewState extends State<GeckoWebview> {
+            GeckoWebviewController? _ctr;
+
+            @override
+            void dispose() {
+              _ctr?._channel.setMethodCallHandler(null);
+              _ctr = null;
+              super.dispose();
+            }
+
+            void _onCreated(int id) {
+              final ctr = GeckoWebviewController._(id);
+              ctr._channel.setMethodCallHandler(_handleCall);
+              _ctr = ctr;
+              widget.onWebViewCreated?.call(ctr);
+            }
+
+            Future<dynamic> _handleCall(MethodCall call) async {
+              final args = call.arguments;
+              final Map m = args is Map ? args : const {};
+              switch (call.method) {
+                case 'onUrlChanged':
+                  final url = m['url'] as String? ?? '';
+                  _ctr?.currentUrl = url;
+                  widget.onUrlChanged?.call(url);
+                  return null;
+                case 'onProgress':
+                  widget.onProgress?.call((m['progress'] as num?)?.toDouble() ?? 0.0);
+                  return null;
+                case 'onTitleChanged':
+                  widget.onTitleChanged?.call(m['title'] as String? ?? '');
+                  return null;
+                case 'onWebMessageReceived':
+                  widget.onWebMessageReceived?.call(m['message'] as String? ?? '');
+                  return null;
+                case 'onNavigationRequest':
+                  final url = m['url'] as String? ?? '';
+                  final cb = widget.onNavigationRequest;
+                  if (cb == null) return true;
+                  try {
+                    return await cb(url);
+                  } catch (_) {
+                    return true;
+                  }
+                case 'onNewWindow':
+                  final url = m['url'] as String? ?? '';
+                  final cb = widget.onNavigationRequest;
+                  var allow = true;
+                  if (cb != null) {
+                    try {
+                      allow = await cb(url);
+                    } catch (_) {}
+                  }
+                  if (allow) _ctr?.loadUrl(url);
+                  return null;
+                case 'onDownload':
+                  widget.onDownload?.call(m['url'] as String? ?? '');
+                  return null;
+                case 'onCloseWindow':
+                  widget.onCloseWindow?.call();
+                  return null;
+              }
+              return null;
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final cookies = widget.cookies;
+              final creationParams = <String, dynamic>{
+                'initialUrl': widget.initialUrl,
+                'initialHtml': widget.initialHtml,
+                'userAgent': widget.userAgent,
+                'incognito': widget.incognito,
+                'cookies': (cookies == null || cookies.isEmpty)
+                    ? null
+                    : jsonEncode(cookies),
+              };
+              return PlatformViewLink(
+                viewType: _viewType,
+                surfaceFactory: (context, controller) {
+                  return AndroidViewSurface(
+                    controller: controller as AndroidViewController,
+                    gestureRecognizers: <Factory<OneSequenceGestureRecognizer>>{
+                      Factory<OneSequenceGestureRecognizer>(
+                        () => EagerGestureRecognizer(),
+                      ),
+                    },
+                    hitTestBehavior: PlatformViewHitTestBehavior.opaque,
+                  );
+                },
+                onCreatePlatformView: (params) {
+                  return PlatformViewsService.initExpensiveAndroidView(
+                      id: params.id,
+                      viewType: _viewType,
+                      layoutDirection: TextDirection.ltr,
+                      creationParams: creationParams,
+                      creationParamsCodec: const StandardMessageCodec(),
+                      onFocus: () => params.onFocusChanged(true),
+                    )
+                    ..addOnPlatformViewCreatedListener(params.onPlatformViewCreated)
+                    ..addOnPlatformViewCreatedListener(_onCreated)
+                    ..create();
+                },
+              );
+            }
+          }
+          """)
+
+          # ---- 6.5 Dart: 网页页面改用 Gecko ----
+          GECKO_IMPORT = "import 'package:PiliPlus/plugin/gecko_webview.dart';\n"
+
+          p = 'lib/pages/webview/view.dart'
+          if 'GeckoWebview' not in read(p):
+              sub(p, "  InAppWebViewController? _webViewController;\n  LinuxWebviewController? _linuxController;\n",
+                     "  InAppWebViewController? _webViewController;\n  LinuxWebviewController? _linuxController;\n"
+                     "  GeckoWebviewController? _geckoController;\n  final bool _useGecko = Platform.isAndroid;\n")
+              sub(p, "  Future<void> _handleMenuItem(WebviewMenuItem item) async {\n    switch (item) {\n",
+                     "  Future<void> _handleMenuItem(WebviewMenuItem item) async {\n"
+                     "    if (_useGecko) {\n      await _handleGeckoMenu(item);\n      return;\n    }\n    switch (item) {\n")
+              sub(p, "  @override\n  Widget build(BuildContext context) {\n    if (Platform.isLinux) {\n      return _buildLinuxView(context);\n    }\n",
+          r"""  List<Map<String, Object?>> _geckoCookies() {
+              if (!LinuxCookieManager.isBiliDomain(_currentUrl)) return const [];
+              return LinuxCookieManager.getCookies().map((c) {
+                return <String, Object?>{
+                  'name': c.name,
+                  'value': c.value,
+                  'domain': c.domain ?? 'bilibili.com',
+                  'path': c.path ?? '/',
+                  'secure': c.secure,
+                  'httpOnly': c.httpOnly,
+                };
+              }).toList();
+            }
+
+            Future<void> _handleGeckoMenu(WebviewMenuItem item) async {
+              final ctr = _geckoController;
+              switch (item) {
+                case WebviewMenuItem.refresh:
+                  ctr?.reload();
+                  break;
+                case WebviewMenuItem.copy:
+                  Utils.copyText(ctr?.currentUrl ?? _currentUrl);
+                  break;
+                case WebviewMenuItem.openInBrowser:
+                  PageUtils.launchURL(ctr?.currentUrl ?? _currentUrl);
+                  break;
+                case WebviewMenuItem.clearCache:
+                  await ctr?.clearCache();
+                  SmartDialog.showToast('已清理');
+                  break;
+                case WebviewMenuItem.goBack:
+                  if (ctr != null && await ctr.canGoBack()) {
+                    ctr.goBack();
+                  } else {
+                    Get.back();
+                  }
+                  break;
+                case WebviewMenuItem.resetCookie:
+                  await ctr?.setCookies(_geckoCookies());
+                  SmartDialog.showToast('设置成功，正在刷新网页');
+                  break;
+              }
+            }
+
+            Future<bool> _geckoNavigationRequest(String u, String initUrl) async {
+              if (u == initUrl) return true;
+              final uri = Uri.tryParse(u);
+              if (!_inApp && uri != null) {
+                final hasMatch = await PiliScheme.routePush(
+                  uri,
+                  selfHandle: true,
+                  off: _off,
+                );
+                if (hasMatch) {
+                  _progress.value = 1;
+                  return false;
+                }
+              }
+              if (_prefixRegex.hasMatch(u)) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      persist: false,
+                      showCloseIcon: true,
+                      content: const Text('当前网页将要打开外部链接，是否打开'),
+                      action: SnackBarAction(
+                        label: '打开',
+                        onPressed: () => PageUtils.launchURL(u),
+                      ),
+                    ),
+                  );
+                }
+                _progress.value = 1;
+                return false;
+              }
+              return true;
+            }
+
+            void _geckoDownload(String url) {
+              if (!mounted) return;
+              showDialog(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('下载文件 ?', style: TextStyle(fontSize: 18)),
+                  content: SelectionText(url),
+                  actions: [
+                    TextButton(
+                      onPressed: Get.back,
+                      child: Text(
+                        '取消',
+                        style: TextStyle(color: Theme.of(context).colorScheme.outline),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () {
+                        Get.back();
+                        PageUtils.launchURL(url);
+                      },
+                      child: const Text('确定'),
+                    ),
+                  ],
+                ),
+              );
+              _progress.value = 1;
+            }
+
+            void _geckoMessage(String msg) {
+              if (msg == 'finishButtonClicked') {
+                if (mounted) Get.back();
+              } else if (msg == 'infoBarClicked') {
+                final uri = Uri.tryParse(_geckoController?.currentUrl ?? _currentUrl);
+                final targetOid = uri?.queryParameters['oid'] ?? widget.oid?.toString();
+                if (targetOid != null) {
+                  PiliScheme.videoPush(int.parse(targetOid), null);
+                }
+              }
+            }
+
+            Widget _buildGeckoView(BuildContext context) {
+              final initUrl = _currentUrl;
+              return Scaffold(
+                appBar: widget.url != null
+                    ? null
+                    : AppBar(
+                        title: Obx(
+                          () => Text(
+                            _title.value.isNotEmpty ? _title.value : _currentUrl,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        bottom: PreferredSize(
+                          preferredSize: Size.zero,
+                          child: Obx(
+                            () => _progress.value < 1
+                                ? LinearProgressIndicator(value: _progress.value)
+                                : const SizedBox.shrink(),
+                          ),
+                        ),
+                        actions: _isPop ? null : _actions,
+                      ),
+                body: _isPop
+                    ? null
+                    : SafeArea(
+                        child: GeckoWebview(
+                          initialUrl: initUrl,
+                          userAgent: userAgent,
+                          cookies: _geckoCookies(),
+                          onWebViewCreated: (ctr) => _geckoController = ctr,
+                          onUrlChanged: (u) {
+                            _currentUrl = u;
+                            if (_title.value.isEmpty || _title.value == _currentUrl) {
+                              _title.value = u;
+                            }
+                          },
+                          onTitleChanged: (t) {
+                            if (t.isNotEmpty) _title.value = t;
+                          },
+                          onProgress: (p) => _progress.value = p,
+                          onWebMessageReceived: _geckoMessage,
+                          onNavigationRequest: (u) => _geckoNavigationRequest(u, initUrl),
+                          onDownload: _geckoDownload,
+                          onCloseWindow: () {
+                            if (mounted) Get.back();
+                          },
+                        ),
+                      ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              if (_useGecko) {
+                return _buildGeckoView(context);
+              }
+              if (Platform.isLinux) {
+                return _buildLinuxView(context);
+              }
+          """)
+              write(p, GECKO_IMPORT + read(p))
+
+          # ---- 6.6 Dart: 极验验证码弹窗改用 Gecko ----
+          p = 'lib/pages/login/geetest/geetest_webview_dialog.dart'
+          if 'GeckoWebview' not in read(p):
+              sub(p, '${Platform.isLinux ? "R=(n,o)=>window.webkit',
+                     '${Platform.isAndroid ? "R=(n,o)=>{location.href=\'pilimsg://m/\'+encodeURIComponent(n+\':\'+JSON.stringify(o))}" : Platform.isLinux ? "R=(n,o)=>window.webkit')
+              sub(p, "    if (Platform.isLinux) {\n      return AlertDialog(\n",
+          r"""    if (Platform.isAndroid) {
+                return AlertDialog(
+                  title: const Text('验证码'),
+                  content: SizedBox(
+                    width: double.maxFinite,
+                    height: MediaQuery.sizeOf(context).height * 0.6,
+                    child: GeckoWebview(
+                      initialHtml: html,
+                      userAgent: BrowserUa.mob,
+                      incognito: true,
+                      onWebMessageReceived: (msg) {
+                        if (msg.startsWith('success:')) {
+                          try {
+                            Get.back(result: jsonDecode(msg.substring('success:'.length)));
+                          } catch (e) {
+                            debugPrint('geetest decode error: $e');
+                          }
+                        } else if (msg.startsWith('error:')) {
+                          debugPrint('geetest error: $msg');
+                        } else if (msg.startsWith('close:')) {
+                          Get.back();
+                        }
+                      },
+                    ),
+                  ),
+                );
+              }
+
+              if (Platform.isLinux) {
+                return AlertDialog(
+          """)
+              write(p, GECKO_IMPORT + read(p))
 
           print('[wear_patch] done')
           PYEOF
